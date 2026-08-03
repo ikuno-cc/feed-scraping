@@ -145,11 +145,22 @@ def _strip_all_query(url: str) -> str:
 
 
 def _is_snapshot_url(url: str) -> bool:
-    """Return True if *url* looks like an archive.ph snapshot URL (short-ID form)."""
+    """
+    Return True if *url* looks like any archive.ph snapshot URL.
+    Handles both short-ID form (/AbCdE) and date-stamped form
+    (/2024.01.15-123456/https://...).
+    """
     parsed = urlparse(url)
     if parsed.netloc not in _ARCHIVE_DOMAINS:
         return False
-    return bool(SNAPSHOT_ID_RE.match(parsed.path))
+    # Short ID
+    if SNAPSHOT_ID_RE.match(parsed.path):
+        snap_id = SNAPSHOT_ID_RE.match(parsed.path).group(1)
+        return snap_id.lower() not in _ARCHIVE_RESERVED
+    # Date-stamped: /YYYY.MM.DD-HHMMSS/https://...
+    if DATE_SNAPSHOT_RE.match(url):
+        return True
+    return False
 
 
 def _extract_snapshot_from_href(href: str) -> str | None:
@@ -181,10 +192,38 @@ def _extract_snapshot_from_href(href: str) -> str | None:
     return None
 
 
+def _date_from_anchor(a) -> str:
+    """
+    Best-effort: get a date/label string for a snapshot anchor.
+    archive.ph thumbnail anchors contain only an <img>, so the date
+    text lives in the parent element or an adjacent sibling node.
+    """
+    # 1. Text inside the anchor itself
+    text = a.get_text(" ", strip=True)
+    if len(text) >= 4:
+        return text
+    # 2. Text from the immediate parent element
+    parent = a.parent
+    if parent:
+        text = parent.get_text(" ", strip=True)
+        if len(text) >= 4:
+            return text
+    # 3. Text from a grandparent container (e.g. <td>)
+    if parent and parent.parent:
+        text = parent.parent.get_text(" ", strip=True)
+        if len(text) >= 4:
+            return text[:120]  # keep it sane
+    return "(date unknown)"
+
+
 def _parse_snapshots_from_html(html_bytes: bytes) -> list[dict]:
     """
     Parse an archive.ph listing page and extract all snapshot entries.
     Returns list of dicts with 'snapshot_url' and 'date_text', most-recent first.
+
+    archive.ph renders snapshots in a table layout where each snapshot
+    thumbnail is an image-only <a href="/ID"><img></a>; the date text
+    sits *outside* the anchor as a plain text node or in the same cell.
     """
     soup = BeautifulSoup(html_bytes, "lxml")
     snapshots: list[dict] = []
@@ -195,25 +234,14 @@ def _parse_snapshots_from_html(html_bytes: bytes) -> list[dict]:
             seen.add(snap_url)
             snapshots.append({"snapshot_url": snap_url, "date_text": date_text})
 
-    # ── Primary: THUMBS-BLOCK / TEXT-BLOCK divs ──────────────────────────────
-    for block in soup.find_all(
-        "div",
-        class_=lambda c: c and any(k in " ".join(c) for k in ("THUMBS", "TEXT")),
-    ):
-        for a in block.find_all("a", href=True):
-            snap = _extract_snapshot_from_href(a["href"])
-            if snap:
-                _add(snap, block.get_text(" ", strip=True))
-
-    # ── Fallback: scan every anchor ───────────────────────────────────────────
-    if not snapshots:
-        for a in soup.find_all("a", href=True):
-            snap = _extract_snapshot_from_href(a["href"])
-            if snap:
-                date_text = a.get_text(strip=True)
-                # Skip icon-only / empty anchors
-                if len(date_text) >= 4:
-                    _add(snap, date_text)
+    # ── Scan every anchor on the page ─────────────────────────────────────────
+    # We intentionally scan ALL anchors (no class filter) because archive.ph
+    # wraps snapshot thumbnails in bare <a> tags without special classes.
+    # _extract_snapshot_from_href filters out navigation/system links.
+    for a in soup.find_all("a", href=True):
+        snap = _extract_snapshot_from_href(a["href"])
+        if snap:
+            _add(snap, _date_from_anchor(a))
 
     return snapshots
 
@@ -575,6 +603,160 @@ def scrape_news(url: str) -> dict:
     result["total_snapshots_available"] = len(snapshots)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Archive submission API
+# ---------------------------------------------------------------------------
+
+def _snapshot_url_from_response(resp) -> str | None:
+    """
+    Try every possible location in an archive.ph HTTP response to find
+    a snapshot URL.  Returns the canonical URL string or None.
+
+    archive.ph can communicate the snapshot URL via:
+      1. The final URL after redirects (most common for cached pages)
+      2. HTTP ``Refresh`` header:  "0; url=https://archive.ph/H6GcX"
+      3. HTML ``<meta http-equiv="refresh">`` content
+      4. Any ``<a href>`` pointing to a snapshot
+      5. ``<input name="url">`` whose value is the snapshot URL
+    """
+    # 1. Redirected to snapshot already
+    if _is_snapshot_url(resp.url):
+        return resp.url
+
+    # 2. HTTP Refresh header
+    refresh_header = resp.headers.get("Refresh", "")
+    if refresh_header:
+        m = re.search(r"url=(.+)", refresh_header, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().rstrip(";").strip()
+            if _is_snapshot_url(candidate):
+                return candidate
+
+    # 3 – 5. Parse the HTML body
+    soup = BeautifulSoup(resp.content, "lxml")
+
+    # 3. <meta http-equiv="refresh" content="5; url=...">
+    meta = soup.find("meta", attrs={"http-equiv": re.compile(r"^refresh$", re.I)})
+    if meta and meta.get("content"):
+        m = re.search(r"url=(.+)", meta["content"], re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if _is_snapshot_url(candidate):
+                return candidate
+
+    # 4. Any <a href> that looks like a snapshot
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if _is_snapshot_url(href):
+            return href
+        snap = _extract_snapshot_from_href(href)
+        if snap:
+            return snap
+
+    # 5. <input name="url"> whose value is the snapshot URL
+    for inp in soup.find_all("input", attrs={"name": re.compile(r"^url$", re.I)}):
+        val = inp.get("value", "")
+        if _is_snapshot_url(val):
+            return val
+
+    return None
+
+
+def submit_to_archive(
+    url: str,
+    force_new: bool = False,
+    poll_interval: float = 4.0,
+    max_wait: float = 120.0,
+) -> dict:
+    """
+    Submit *url* to archive.ph for archiving and return the snapshot URL.
+
+    Parameters
+    ----------
+    url:           The original news article URL to archive.
+    force_new:     If True, pass ``anyway=1`` to force a fresh snapshot even
+                   when archive.ph has a recent one.
+    poll_interval: Seconds to wait between status polls (default 4 s).
+    max_wait:      Maximum total seconds to wait for archive.ph to finish
+                   processing before giving up (default 120 s).
+
+    Returns a dict with at minimum:
+      - ``archive_url``   – the https://archive.ph/XXXXX snapshot URL
+      - ``original_url``  – the cleaned input URL
+      - ``status``        – "archived" | "processing" | "error"
+      - ``submitted_at``  – UTC ISO timestamp
+    """
+    import time
+
+    session = _make_session()
+    clean_url = _strip_tracking_params(url)
+    submitted_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    form_data: dict = {"url": clean_url}
+    if force_new:
+        form_data["anyway"] = "1"
+
+    # ── Step 1: POST the submission ─────────────────────────────────────────
+    try:
+        resp = session.post(
+            f"{ARCHIVE_BASE}/submit/",
+            data=form_data,
+            timeout=60,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        return {
+            "error": f"Failed to submit to archive.ph: {exc}",
+            "original_url": clean_url,
+            "status": "error",
+            "submitted_at": submitted_at,
+        }
+
+    # ── Step 2: extract snapshot URL from initial response ──────────────────
+    snapshot_url = _snapshot_url_from_response(resp)
+    if snapshot_url:
+        return {
+            "archive_url": snapshot_url,
+            "original_url": clean_url,
+            "status": "archived",
+            "submitted_at": submitted_at,
+        }
+
+    # ── Step 3: poll until archive.ph finishes processing ───────────────────
+    # archive.ph may return a "saving…" page; we poll the same URL until
+    # we get a proper snapshot URL back.
+    deadline = time.monotonic() + max_wait
+    poll_url = resp.url  # the URL archive.ph is processing at
+
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        try:
+            poll_resp = session.get(poll_url, timeout=30, allow_redirects=True)
+            snapshot_url = _snapshot_url_from_response(poll_resp)
+            if snapshot_url:
+                return {
+                    "archive_url": snapshot_url,
+                    "original_url": clean_url,
+                    "status": "archived",
+                    "submitted_at": submitted_at,
+                }
+            poll_url = poll_resp.url  # follow any intermediate redirects
+        except Exception:
+            continue
+
+    return {
+        "error": f"archive.ph did not finish within {int(max_wait)} seconds.",
+        "original_url": clean_url,
+        "status": "processing",
+        "submitted_at": submitted_at,
+        "hint": (
+            "The page may still be archiving. "
+            "Try calling GET https://archive.ph/newest/{url} in a few minutes."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

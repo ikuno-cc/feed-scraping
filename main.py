@@ -5,9 +5,14 @@ Archive.ph News Scraper — REST API
 FastAPI application that exposes the scraper as HTTP endpoints.
 
 Endpoints:
-  GET  /health          Health check (Coolify / Docker probe)
-  GET  /                API info & usage
-  POST /scrape          Scrape a news article via archive.ph
+  GET  /health               Health check (Coolify / Docker probe)
+  GET  /                     API info & usage
+  POST /archive-submit       Submit a URL to archive.ph and get back the snapshot URL
+  POST /scrape               Scrape a news article via archive.ph
+
+Recommended n8n workflow:
+  1. POST /archive-submit  →  get archive_url  (e.g. https://archive.ph/H6GcX)
+  2. POST /scrape          →  pass archive_url  →  get full article JSON
 
 Optional authentication:
   Set the API_KEY environment variable to require an X-Api-Key header.
@@ -25,10 +30,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, field_validator
 
-from scraper import scrape_news
+from scraper import scrape_news, submit_to_archive
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,10 +72,10 @@ def verify_api_key(key: Optional[str] = Security(api_key_header)) -> None:
 app = FastAPI(
     title="Archive.ph News Scraper",
     description=(
-        "Given any news article URL, searches archive.ph for all snapshots, "
-        "picks the most recent one, and returns structured article metadata as JSON."
+        "Submit any news URL to archive.ph, then scrape the archived article "
+        "for structured metadata — title, author, date, content, and more."
     ),
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -86,27 +90,67 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Shared URL validator
+# ---------------------------------------------------------------------------
+
+def _validate_url(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("url must not be empty")
+    if not v.startswith(("http://", "https://")):
+        raise ValueError("url must start with http:// or https://")
+    return v
+
+
+# ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
 
-class ScrapeRequest(BaseModel):
+class ArchiveSubmitRequest(BaseModel):
+    """Body for POST /archive-submit."""
     url: str
+    force_new: bool = False
 
     @field_validator("url")
     @classmethod
-    def url_must_be_non_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("url must not be empty")
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("url must start with http:// or https://")
-        return v
+    def url_must_be_valid(cls, v: str) -> str:
+        return _validate_url(v)
 
     model_config = {
         "json_schema_extra": {
             "examples": [
+                {
+                    "url": "https://www.ft.com/content/e9027253-e13c-460a-a4b1-f9047e5a6ca7",
+                    "force_new": False,
+                }
+            ]
+        }
+    }
+
+
+class ArchiveSubmitResponse(BaseModel):
+    archive_url: Optional[str] = None
+    original_url: str
+    status: str                    # "archived" | "processing" | "error"
+    submitted_at: str
+    error: Optional[str] = None
+    hint: Optional[str] = None
+
+
+class ScrapeRequest(BaseModel):
+    """Body for POST /scrape."""
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def url_must_be_valid(cls, v: str) -> str:
+        return _validate_url(v)
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"url": "https://archive.ph/H6GcX"},
                 {"url": "https://www.bbc.com/news/articles/abc123"},
-                {"url": "https://www.reuters.com/world/some-story-2024-01-15/"},
             ]
         }
     }
@@ -144,37 +188,94 @@ def health_check():
 @app.get(
     "/",
     summary="API info",
-    description="Returns basic usage information about the API.",
+    description="Returns usage information and curl examples for all endpoints.",
     tags=["System"],
 )
 def root():
     return {
         "service": "Archive.ph News Scraper",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "auth_required": bool(_API_KEY),
+        "workflow": [
+            "1. POST /archive-submit  ->  submits URL to archive.ph, returns archive_url",
+            "2. POST /scrape          ->  pass the archive_url, returns full article JSON",
+        ],
         "endpoints": {
-            "POST /scrape": "Scrape a news article from archive.ph",
-            "GET  /health": "Health check",
-            "GET  /docs":   "Interactive Swagger UI",
-            "GET  /redoc":  "ReDoc documentation",
+            "POST /archive-submit": "Submit a news URL to archive.ph -> get snapshot URL",
+            "POST /scrape":         "Scrape an article from archive.ph -> get full JSON",
+            "GET  /health":         "Health check",
+            "GET  /docs":           "Interactive Swagger UI",
+            "GET  /redoc":          "ReDoc documentation",
         },
-        "curl_example": (
-            'curl -X POST https://your-domain.com/scrape '
-            '-H "Content-Type: application/json" '
-            '-H "X-Api-Key: YOUR_KEY" '
-            '-d \'{"url": "https://www.bbc.com/news/articles/abc123"}\''
-        ),
+        "curl_examples": {
+            "step_1_archive": (
+                'curl -X POST https://your-domain.com/archive-submit '
+                '-H "Content-Type: application/json" '
+                '-H "X-Api-Key: YOUR_KEY" '
+                '-d \'{"url": "https://www.ft.com/content/abc123", "force_new": false}\''
+            ),
+            "step_2_scrape": (
+                'curl -X POST https://your-domain.com/scrape '
+                '-H "Content-Type: application/json" '
+                '-H "X-Api-Key: YOUR_KEY" '
+                '-d \'{"url": "https://archive.ph/H6GcX"}\''
+            ),
+        },
     }
+
+
+@app.post(
+    "/archive-submit",
+    response_model=ArchiveSubmitResponse,
+    summary="Submit URL to archive.ph",
+    description=(
+        "Submits a news article URL to **archive.ph** for archiving. "
+        "Waits up to 120 seconds for archive.ph to finish processing, then "
+        "returns the canonical snapshot URL (e.g. `https://archive.ph/H6GcX`). "
+        "\n\n"
+        "Set `force_new: true` to always create a fresh snapshot even when archive.ph "
+        "already has a recent one. Defaults to `false` which reuses an existing snapshot "
+        "if available (faster).\n\n"
+        "**Typical n8n flow**: call this first, take `archive_url`, then call `POST /scrape`."
+    ),
+    tags=["Archiver"],
+    dependencies=[Security(verify_api_key)],
+)
+def archive_submit_endpoint(body: ArchiveSubmitRequest):
+    log.info("Submitting to archive.ph: %s (force_new=%s)", body.url, body.force_new)
+    try:
+        result = submit_to_archive(url=body.url, force_new=body.force_new)
+    except Exception as exc:
+        log.exception("Archive submission error for %s: %s", body.url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Archive submission error: {exc}",
+        )
+
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("error", "Unknown archive.ph error"),
+        )
+
+    log.info(
+        "Archived: %s -> %s (status=%s)",
+        body.url, result.get("archive_url"), result.get("status"),
+    )
+    return result
 
 
 @app.post(
     "/scrape",
     response_model=ScrapeResponse,
-    summary="Scrape a news article",
+    summary="Scrape an archived article",
     description=(
-        "Accepts a news article URL, searches archive.ph for all archived snapshots, "
-        "automatically selects the **most recent** snapshot, and returns all available "
-        "article metadata: title, author, published date, content, origin site, and URLs."
+        "Accepts either an **original news URL** or a direct **archive.ph snapshot URL** "
+        "(e.g. `https://archive.ph/H6GcX`). "
+        "Finds the most recent snapshot and returns all available article metadata: "
+        "title, author, published date, full content, origin site, and URLs."
+        "\n\n"
+        "**Tip**: pass the `archive_url` returned by `POST /archive-submit` directly here."
     ),
     tags=["Scraper"],
     dependencies=[Security(verify_api_key)],
@@ -197,5 +298,5 @@ def scrape_endpoint(body: ScrapeRequest):
             detail=result["error"],
         )
 
-    log.info("Done: %s — archive: %s", body.url, result.get("archive_url"))
+    log.info("Done: %s -- archive: %s", body.url, result.get("archive_url"))
     return result
