@@ -1,0 +1,10 @@
+# REST API framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# TLS fingerprint spoofing — best for bypassing Cloudflare at the HTTP level
+curl_cffi>=0.7.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
