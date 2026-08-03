@@ -21,7 +21,7 @@ import json
 import re
 import argparse
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
@@ -36,8 +36,38 @@ ARCHIVE_BASE = "https://archive.ph"
 # Mimic a real Chrome browser for TLS fingerprint and headers
 BROWSER_IMPERSONATE = "chrome120"
 
-# Snapshot short-ID pattern used by archive.ph (4–10 alphanumeric chars)
+# Short snapshot ID — relative path: /AbCdE
 SNAPSHOT_ID_RE = re.compile(r"^/([A-Za-z0-9]{4,12})$")
+
+# Absolute snapshot URL on any archive.ph mirror domain
+SNAPSHOT_ABS_RE = re.compile(
+    r"^https?://archive\.(ph|today|is|li|fo|vn|md)/([A-Za-z0-9]{4,12})$"
+)
+
+# Date-stamped snapshot path: /2024.01.15-123456/https://...
+DATE_SNAPSHOT_RE = re.compile(
+    r"^(?:https?://archive\.(?:ph|today|is|li|fo|vn|md))?/\d{4}\.\d{2}\.\d{2}-\d{6}/https?://"
+)
+
+# Tracking/syndication query-param names to strip before searching archive.ph
+_TRACKING_RE = re.compile(
+    r"^(utm_\w+|syn[-_]\w+|fbclid|gclid|ref|s|source|campaign|medium|"
+    r"content|term|mc_cid|mc_eid|_ga|yclid|msclkid|twclid|igshid|"
+    r"cmpid|cx_navSource|taid|shareType|shareSource|referrer)$",
+    re.IGNORECASE,
+)
+
+# All known archive.ph mirror domains
+_ARCHIVE_DOMAINS = {
+    "archive.ph", "archive.today", "archive.is",
+    "archive.li", "archive.fo", "archive.vn", "archive.md",
+}
+
+# archive.ph's own navigation/system paths that must NOT be treated as snapshots
+_ARCHIVE_RESERVED = {
+    "newest", "rss", "faq", "blog", "donate", "alldomains",
+    "search", "about", "contact", "api", "robots.txt",
+}
 
 # Common article content container class fragments (ordered by priority)
 CONTENT_CLASS_HINTS = [
@@ -89,80 +119,165 @@ def _make_session() -> cffi_requests.Session:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Search archive.ph for snapshots
+# Step 1 — URL cleaning + snapshot search
 # ---------------------------------------------------------------------------
 
-def search_snapshots(url: str, session: cffi_requests.Session) -> list[dict]:
+def _strip_tracking_params(url: str) -> str:
     """
-    Fetch the archive.ph listing page for *url* and return a list of snapshot dicts
-    sorted most-recent-first, each with keys: 'snapshot_url', 'date_text'.
-
-    If archive.ph redirects directly to a single snapshot, that snapshot is
-    returned as a one-element list.
+    Remove known tracking/syndication query parameters (utm_*, syn-*, fbclid …)
+    while preserving any genuinely content-relevant query params.
     """
-    search_url = f"{ARCHIVE_BASE}/{url}"
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    filtered = {
+        k: v for k, v in parse_qs(parsed.query, keep_blank_values=True).items()
+        if not _TRACKING_RE.match(k)
+    }
+    new_query = urlencode(filtered, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
 
-    resp = session.get(search_url, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
 
-    final_url: str = resp.url  # may have been redirected
-
-    # --- Case A: redirected directly to a snapshot page ---
-    # archive.ph redirects to the most-recent snapshot when only one exists
-    # or when the URL is already a known archive link.
-    if _is_snapshot_url(final_url) and final_url.rstrip("/") != search_url.rstrip("/"):
-        return [{"snapshot_url": final_url, "date_text": "latest (redirected)"}]
-
-    soup = BeautifulSoup(resp.content, "lxml")
-    snapshots: list[dict] = []
-
-    # --- Case B: listing page with multiple snapshots ---
-    # archive.ph renders each snapshot inside a <div class="TEXT-BLOCK"> or
-    # <div class="THUMBS-BLOCK">.  The anchor inside contains the short ID.
-    # We also do a broader fallback scan for any anchor whose href is a short ID.
-
-    seen_ids: set[str] = set()
-
-    # Primary: structured blocks
-    for block in soup.find_all("div", class_=lambda c: c and ("THUMBS" in c or "TEXT" in c)):
-        for a in block.find_all("a", href=True):
-            match = SNAPSHOT_ID_RE.match(a["href"])
-            if match and match.group(1) not in seen_ids:
-                snap_id = match.group(1)
-                seen_ids.add(snap_id)
-                snapshots.append({
-                    "snapshot_url": f"{ARCHIVE_BASE}/{snap_id}",
-                    "date_text": block.get_text(" ", strip=True),
-                })
-
-    # Fallback: scan every anchor on the page
-    if not snapshots:
-        for a in soup.find_all("a", href=True):
-            match = SNAPSHOT_ID_RE.match(a["href"])
-            if match and match.group(1) not in seen_ids:
-                snap_id = match.group(1)
-                seen_ids.add(snap_id)
-                date_text = a.get_text(strip=True)
-                # Skip purely navigational links (empty text or icons)
-                if len(date_text) < 4:
-                    continue
-                snapshots.append({
-                    "snapshot_url": f"{ARCHIVE_BASE}/{snap_id}",
-                    "date_text": date_text,
-                })
-
-    # archive.ph lists most-recent first, so we preserve order
-    return snapshots
+def _strip_all_query(url: str) -> str:
+    """Return URL without any query string or fragment."""
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(query="", fragment=""))
 
 
 def _is_snapshot_url(url: str) -> bool:
-    """Return True if *url* looks like an archive.ph snapshot URL."""
+    """Return True if *url* looks like an archive.ph snapshot URL (short-ID form)."""
     parsed = urlparse(url)
-    if parsed.netloc not in ("archive.ph", "archive.today", "archive.is",
-                             "archive.li", "archive.fo", "archive.vn",
-                             "archive.md"):
+    if parsed.netloc not in _ARCHIVE_DOMAINS:
         return False
     return bool(SNAPSHOT_ID_RE.match(parsed.path))
+
+
+def _extract_snapshot_from_href(href: str) -> str | None:
+    """
+    Given an anchor href from archive.ph, return the canonical snapshot URL
+    if it looks like a snapshot, else None.
+
+    Handles:
+      - Relative short IDs:  /AbCdE
+      - Absolute short IDs:  https://archive.ph/AbCdE
+      - Date-stamped paths:  /2024.01.15-123456/https://...
+    """
+    # Relative short ID (but not a reserved archive.ph system path)
+    m = SNAPSHOT_ID_RE.match(href)
+    if m and m.group(1).lower() not in _ARCHIVE_RESERVED:
+        return f"{ARCHIVE_BASE}/{m.group(1)}"
+
+    # Absolute short ID URL (not a reserved path)
+    m = SNAPSHOT_ABS_RE.match(href)
+    if m and m.group(2).lower() not in _ARCHIVE_RESERVED:
+        return href  # already a full canonical URL
+
+    # Date-stamped snapshot (relative or absolute)
+    if DATE_SNAPSHOT_RE.match(href):
+        if href.startswith("http"):
+            return href
+        return f"{ARCHIVE_BASE}{href}"
+
+    return None
+
+
+def _parse_snapshots_from_html(html_bytes: bytes) -> list[dict]:
+    """
+    Parse an archive.ph listing page and extract all snapshot entries.
+    Returns list of dicts with 'snapshot_url' and 'date_text', most-recent first.
+    """
+    soup = BeautifulSoup(html_bytes, "lxml")
+    snapshots: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(snap_url: str, date_text: str) -> None:
+        if snap_url not in seen:
+            seen.add(snap_url)
+            snapshots.append({"snapshot_url": snap_url, "date_text": date_text})
+
+    # ── Primary: THUMBS-BLOCK / TEXT-BLOCK divs ──────────────────────────────
+    for block in soup.find_all(
+        "div",
+        class_=lambda c: c and any(k in " ".join(c) for k in ("THUMBS", "TEXT")),
+    ):
+        for a in block.find_all("a", href=True):
+            snap = _extract_snapshot_from_href(a["href"])
+            if snap:
+                _add(snap, block.get_text(" ", strip=True))
+
+    # ── Fallback: scan every anchor ───────────────────────────────────────────
+    if not snapshots:
+        for a in soup.find_all("a", href=True):
+            snap = _extract_snapshot_from_href(a["href"])
+            if snap:
+                date_text = a.get_text(strip=True)
+                # Skip icon-only / empty anchors
+                if len(date_text) >= 4:
+                    _add(snap, date_text)
+
+    return snapshots
+
+
+def search_snapshots(url: str, session: cffi_requests.Session) -> list[dict]:
+    """
+    Search archive.ph for snapshots of *url*.
+
+    Strategy (in order):
+      1. Strip tracking params → try ``/newest/{clean_url}``  (direct redirect)
+      2. Try the full listing page for ``clean_url``
+      3. If still empty, strip *all* query params and repeat 1–2
+
+    Returns a list of snapshot dicts, most-recent first.
+    """
+    clean_url = _strip_tracking_params(url)
+    bare_url  = _strip_all_query(url)
+
+    for candidate in _dedupe([clean_url, bare_url]):
+        # ── Try /newest/ first (fastest path) ────────────────────────────────
+        try:
+            resp = session.get(
+                f"{ARCHIVE_BASE}/newest/{candidate}",
+                timeout=20,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200 and _is_snapshot_url(resp.url):
+                return [{"snapshot_url": resp.url, "date_text": "latest (newest endpoint)"}]
+        except Exception:
+            pass  # /newest/ not available; continue to listing page
+
+        # ── Try the listing page ──────────────────────────────────────────────
+        try:
+            resp = session.get(
+                f"{ARCHIVE_BASE}/{candidate}",
+                timeout=30,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except Exception:
+            continue
+
+        final_url: str = resp.url
+
+        # Direct redirect to a snapshot
+        if _is_snapshot_url(final_url):
+            return [{"snapshot_url": final_url, "date_text": "latest (redirected)"}]
+
+        snapshots = _parse_snapshots_from_html(resp.content)
+        if snapshots:
+            return snapshots
+
+    return []
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Return *items* with duplicates removed, preserving order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -432,13 +547,16 @@ def scrape_news(url: str) -> dict:
     session = _make_session()
 
     # ── Step 1: find snapshots ──────────────────────────────────────────────
+    # Use the tracking-stripped URL as the canonical "original" URL so
+    # downstream consumers don't see noisy referral params.
+    clean_url = _strip_tracking_params(url)
     snapshots = search_snapshots(url, session)
 
     if not snapshots:
         return {
             "error": "No snapshots found on archive.ph for this URL.",
-            "original_url": url,
-            "archive_search_url": f"{ARCHIVE_BASE}/{url}",
+            "original_url": clean_url,
+            "archive_search_url": f"{ARCHIVE_BASE}/{_strip_all_query(url)}",
             "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
@@ -448,7 +566,7 @@ def scrape_news(url: str) -> dict:
     # ── Step 3: scrape the archived article ─────────────────────────────────
     result = scrape_snapshot(
         snapshot_url=most_recent["snapshot_url"],
-        original_url=url,
+        original_url=clean_url,   # use the cleaned URL as canonical
         session=session,
     )
 
